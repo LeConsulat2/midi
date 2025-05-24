@@ -1,350 +1,189 @@
 import sys
-import argparse
-import logging
 import os
-import subprocess
+import logging
 import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
+import librosa
+import pretty_midi
 
-# Check for scipy
+# Optional dependencies with graceful fallbacks
 try:
-    from scipy.signal import find_peaks
+    from scipy.signal import find_peaks, butter, filtfilt
     from scipy import ndimage
     SCIPY_AVAILABLE = True
 except ImportError:
-    print("Warning: scipy not installed. Install with: pip install scipy")
+    print("Warning: scipy not installed. Using basic algorithms.")
     SCIPY_AVAILABLE = False
-
-# Check for required libraries and provide helpful error messages
-try:
-    import pretty_midi
-except ImportError:
-    print("Error: pretty_midi not installed. Install with: pip install pretty_midi")
-    sys.exit(1)
-
-try:
-    import librosa
-except ImportError:
-    print("Error: librosa not installed. Install with: pip install librosa")
-    sys.exit(1)
 
 try:
     import moviepy.editor as mp
     MOVIEPY_AVAILABLE = True
 except ImportError:
-    print("Warning: moviepy not installed. MP4/video files not supported.")
-    print("Install with: pip install moviepy")
+    print("Warning: moviepy not available. Video files not supported.")
     MOVIEPY_AVAILABLE = False
 
-# Try to import tensorflow for magenta
-try:
-    import tensorflow as tf
-    tf.get_logger().setLevel('ERROR')
-    os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-except ImportError:
-    print("Warning: TensorFlow not installed. Some transcription methods may not work.")
-
-# Try to import magenta
-try:
-    from magenta.models.onsets_frames_transcription import infer_util
-    from magenta.models.onsets_frames_transcription import constants
-    MAGENTA_AVAILABLE = True
-except ImportError:
-    print("Warning: Magenta not installed. Falling back to enhanced transcription.")
-    print("For best results, install with: pip install magenta")
-    MAGENTA_AVAILABLE = False
-
 # Setup logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("piano_transcription")
 
 
-class PianoTranscriber:
-    """Enhanced Piano transcription pipeline with improved algorithms"""
-
+class AdvancedPianoTranscriber:
+    """Advanced piano transcription with balanced detection"""
+    
     def __init__(self, config: Dict):
         self.config = config
-
+        self.sr = 22050
+        
     def transcribe_audio(self, input_audio: str) -> str:
-        """
-        Transcribes piano audio to MIDI using available methods
-        Returns path to the created MIDI file
-        """
-        logger.info(f"Transcribing piano audio: {input_audio}")
+        """Main transcription method with hybrid approach"""
+        logger.info(f"Transcribing: {input_audio}")
         
         if not os.path.isfile(input_audio):
-            raise FileNotFoundError(f"Input audio file not found: {input_audio}")
-        
+            raise FileNotFoundError(f"Input file not found: {input_audio}")
+            
         output_dir = self.config["output_dir"]
         os.makedirs(output_dir, exist_ok=True)
-
-        # Handle video files by extracting audio first
+        
+        # Handle video files
         audio_file = self._prepare_audio_file(input_audio, output_dir)
-
-        midi_path = None
         
-        # Method 1: Try Basic Pitch (Spotify's open-source model)
-        if self.config.get("use_basic_pitch", True):
-            try:
-                midi_path = self._transcribe_with_basic_pitch(audio_file, output_dir)
-            except Exception as e:
-                logger.warning(f"Basic Pitch transcription failed: {e}")
+        # Load and preprocess audio
+        y, sr = librosa.load(audio_file, sr=self.sr)
+        y = self._preprocess_audio(y)
         
-        # Method 2: Try Magenta if available
-        if not midi_path and MAGENTA_AVAILABLE and self.config.get("checkpoint_dir"):
-            try:
-                midi_path = self._transcribe_with_magenta(audio_file, output_dir)
-            except Exception as e:
-                logger.warning(f"Magenta transcription failed: {e}")
+        logger.info(f"Audio loaded: {len(y)/sr:.1f} seconds")
         
-        # Method 3: Enhanced multi-pitch transcription
-        if not midi_path:
-            if SCIPY_AVAILABLE:
-                logger.info("Using enhanced multi-pitch transcription method")
-                midi_path = self._transcribe_enhanced(audio_file, output_dir)
-            else:
-                logger.info("Using basic transcription method (scipy not available)")
-                midi_path = self._transcribe_basic_improved(audio_file, output_dir)
-
-        if not midi_path or not os.path.isfile(midi_path):
-            raise FileNotFoundError(f"Transcription failed - no MIDI file created")
-
-        logger.info(f"Raw transcription saved to: {midi_path}")
+        # Create MIDI
+        pm = pretty_midi.PrettyMIDI()
+        piano = pretty_midi.Instrument(program=0, name="Piano")
+        
+        # Use hybrid approach: CQT analysis + smart filtering
+        notes = self._hybrid_transcribe(y, sr)
+        piano.notes.extend(notes)
+        
+        # Smart cleanup (less aggressive than before)
+        piano.notes = self._smart_cleanup(piano.notes)
+        
+        pm.instruments.append(piano)
+        
+        # Save
+        base_name = os.path.splitext(os.path.basename(input_audio))[0]
+        midi_path = os.path.join(output_dir, f"{base_name}_advanced.mid")
+        pm.write(midi_path)
+        
+        logger.info(f"Created MIDI with {len(piano.notes)} notes")
         return midi_path
-
+    
     def _prepare_audio_file(self, input_file: str, output_dir: str) -> str:
-        """Prepare audio file for transcription"""
+        """Extract audio from video if needed"""
         file_ext = os.path.splitext(input_file)[1].lower()
         video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv', '.webm', '.m4v']
         
         if file_ext in video_extensions:
             if not MOVIEPY_AVAILABLE:
-                raise RuntimeError(f"Video file detected but moviepy not installed")
-            
-            logger.info(f"Extracting audio from video file: {input_file}")
+                raise RuntimeError("Video file detected but moviepy not installed")
+                
+            logger.info("Extracting audio from video...")
             base_name = os.path.splitext(os.path.basename(input_file))[0]
             temp_audio = os.path.join(output_dir, f"{base_name}_extracted.wav")
             
             try:
                 video = mp.VideoFileClip(input_file)
-                audio = video.audio
-                if audio is None:
-                    raise RuntimeError("No audio track found in video file")
-                
-                audio.write_audiofile(temp_audio, verbose=False, logger=None)
-                audio.close()
+                if video.audio is None:
+                    raise RuntimeError("No audio track in video")
+                video.audio.write_audiofile(temp_audio, verbose=False, logger=None)
                 video.close()
-                
-                logger.info(f"Audio extracted to: {temp_audio}")
                 return temp_audio
-                
             except Exception as e:
-                raise RuntimeError(f"Failed to extract audio from video: {e}")
+                raise RuntimeError(f"Failed to extract audio: {e}")
         
         return input_file
-
-    def _transcribe_with_basic_pitch(self, input_audio: str, output_dir: str) -> str:
-        """Try to use Basic Pitch (best free option)"""
-        try:
-            # Check if basic-pitch is available
-            result = subprocess.run(["basic-pitch", "--help"], 
-                                  capture_output=True, text=True, timeout=5)
-            if result.returncode != 0:
-                raise RuntimeError("basic-pitch command not found")
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            raise RuntimeError("Basic Pitch not installed. Install with: pip install basic-pitch")
-
-        logger.info("Using Basic Pitch for transcription")
-        
-        # Run Basic Pitch
-        cmd = [
-            "basic-pitch", 
-            output_dir, 
-            input_audio,
-            "--onset-threshold", "0.5",
-            "--frame-threshold", "0.3", 
-            "--minimum-note-length", "58",  # ~0.13 seconds at 22050 Hz
-            "--minimum-frequency", str(librosa.note_to_hz('A0')),  # Piano range
-            "--maximum-frequency", str(librosa.note_to_hz('C8'))
-        ]
-        
-        try:
-            subprocess.run(cmd, check=True, timeout=600)  # 10 minute timeout
-        except subprocess.TimeoutExpired:
-            raise RuntimeError("Basic Pitch transcription timed out")
-        except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Basic Pitch failed with error: {e}")
-        
-        # Find the created MIDI file
-        base_name = os.path.splitext(os.path.basename(input_audio))[0]
-        possible_paths = [
-            os.path.join(output_dir, f"{base_name}_basic_pitch.mid"),
-            os.path.join(output_dir, f"{base_name}.mid")
-        ]
-        
-        for path in possible_paths:
-            if os.path.isfile(path):
-                return path
-                
-        raise FileNotFoundError("Basic Pitch didn't create expected MIDI file")
-
-    def _transcribe_with_magenta(self, input_audio: str, output_dir: str) -> str:
-        """Transcribe using Magenta's onsets-and-frames model"""
-        checkpoint = self.config["checkpoint_dir"]
-        
-        # Load audio at correct sample rate
-        audio, sr = librosa.load(input_audio, sr=constants.SAMPLE_RATE)
-        
-        # Run inference
-        sequence = infer_util.infer(audio, checkpoint)
-        
-        # Save MIDI
-        base = os.path.splitext(os.path.basename(input_audio))[0]
-        midi_path = os.path.join(output_dir, f"{base}_magenta.mid")
-        
-        pretty_midi.sequence_proto_to_pretty_midi(sequence).write(midi_path)
-        return midi_path
-
-    def _transcribe_enhanced(self, input_audio: str, output_dir: str) -> str:
-        """Enhanced multi-pitch transcription using spectral analysis"""
-        logger.info("Using enhanced spectral transcription method")
-        
-        # Load audio with higher sample rate for better frequency resolution
-        y, sr = librosa.load(input_audio, sr=44100)
-        
-        # Enhance audio quality
-        y = self._preprocess_audio(y, sr)
-        
-        # Create MIDI object
-        pm = pretty_midi.PrettyMIDI()
-        piano = pretty_midi.Instrument(program=0)
-        
-        # Get spectral representation
-        hop_length = 512
-        n_fft = 4096  # Higher for better frequency resolution
-        
-        # Compute CQT (Constant-Q Transform) - better for musical notes
-        # Use compatible parameters for older librosa versions
-        try:
-            cqt = np.abs(librosa.cqt(y, sr=sr, hop_length=hop_length, 
-                                    fmin=librosa.note_to_hz('A0'), 
-                                    fmax=librosa.note_to_hz('C8'),
-                                    n_bins=88))  # 88 piano keys
-        except TypeError:
-            # Fallback for older librosa versions
-            cqt = np.abs(librosa.cqt(y, sr=sr, hop_length=hop_length, 
-                                    fmin=librosa.note_to_hz('A0'), 
-                                    n_bins=88))  # 88 piano keys
-        
-        # Normalize
-        cqt = librosa.util.normalize(cqt, axis=0)
-        
-        # Time axis
-        times = librosa.frames_to_time(np.arange(cqt.shape[1]), 
-                                     sr=sr, hop_length=hop_length)
-        
-        # For each piano key, detect note events
-        min_note_frames = int(0.1 * sr / hop_length)  # Minimum 100ms note
-        
-        for note_idx in range(88):  # 88 piano keys
-            midi_note = 21 + note_idx  # A0 = MIDI 21
-            
-            # Get the magnitude profile for this note
-            magnitude = cqt[note_idx, :]
-            
-            # Smooth the signal
-            magnitude = ndimage.gaussian_filter1d(magnitude, sigma=2)
-            
-            # Find note onsets and offsets
-            notes = self._detect_note_events(magnitude, times, midi_note, min_note_frames)
-            piano.notes.extend(notes)
-        
-        # Sort notes by start time
-        piano.notes.sort(key=lambda x: x.start)
-        
-        # Remove very short notes and overlaps
-        piano.notes = self._clean_notes(piano.notes)
-        
-        pm.instruments.append(piano)
-        
-        # Save MIDI
-        base = os.path.splitext(os.path.basename(input_audio))[0]
-        midi_path = os.path.join(output_dir, f"{base}_enhanced.mid")
-        pm.write(midi_path)
-        
-        return midi_path
-
-    def _preprocess_audio(self, y: np.ndarray, sr: int) -> np.ndarray:
-        """Preprocess audio for better transcription"""
+    
+    def _preprocess_audio(self, y: np.ndarray) -> np.ndarray:
+        """Clean up audio but preserve musical content"""
         # Remove DC offset
         y = y - np.mean(y)
         
         # Normalize
         y = librosa.util.normalize(y)
         
-        # Apply subtle high-pass filter to reduce low-frequency noise
-        y = librosa.effects.preemphasis(y, coef=0.97)
+        # Very gentle high-pass filter (just remove extreme low frequencies)
+        if SCIPY_AVAILABLE:
+            b, a = butter(1, 40.0 / (self.sr / 2), btype='high')  # Gentler filter
+            y = filtfilt(b, a, y)
         
         return y
-
-    def _detect_note_events(self, magnitude: np.ndarray, times: np.ndarray, 
-                          midi_note: int, min_note_frames: int) -> List[pretty_midi.Note]:
-        """Detect individual note events from magnitude profile"""
+    
+    def _hybrid_transcribe(self, y: np.ndarray, sr: int) -> List[pretty_midi.Note]:
+        """Hybrid approach: comprehensive detection + smart filtering"""
         notes = []
         
-        # Adaptive threshold
-        threshold = np.mean(magnitude) + 2 * np.std(magnitude)
-        threshold = max(threshold, 0.1)  # Minimum threshold
+        hop_length = 512
         
-        # Find peaks (note onsets)
-        if SCIPY_AVAILABLE:
-            peaks, properties = find_peaks(magnitude, 
-                                         height=threshold,
-                                         distance=min_note_frames,
-                                         prominence=threshold * 0.5)
-        else:
-            # Simple peak detection fallback
-            peaks = []
-            for i in range(min_note_frames, len(magnitude) - min_note_frames):
-                if (magnitude[i] > threshold and 
-                    magnitude[i] > magnitude[i-1] and 
-                    magnitude[i] > magnitude[i+1]):
-                    # Check if it's far enough from previous peaks
-                    if not peaks or (i - peaks[-1]) >= min_note_frames:
-                        peaks.append(i)
-            peaks = np.array(peaks)
+        # 1. Use CQT (Constant-Q Transform) for better musical note detection
+        logger.info("Computing CQT analysis...")
         
-        if len(peaks) == 0:
-            return notes
+        # CQT parameters for piano range
+        fmin = librosa.note_to_hz('A0')  # Lowest piano note
+        n_bins = 88  # 88 piano keys
+        bins_per_octave = 12
         
-        # For each peak, find the corresponding note duration
-        for peak_idx in peaks:
-            start_time = times[peak_idx]
+        try:
+            # Try modern librosa first
+            cqt = np.abs(librosa.cqt(y, sr=sr, hop_length=hop_length, 
+                                   fmin=fmin, n_bins=n_bins, 
+                                   bins_per_octave=bins_per_octave))
+        except TypeError:
+            # Fallback for older versions
+            cqt = np.abs(librosa.cqt(y, sr=sr, hop_length=hop_length, 
+                                   fmin=fmin, n_bins=n_bins))
+        
+        # Normalize CQT
+        cqt = librosa.util.normalize(cqt, axis=1)
+        
+        # Time axis
+        times = librosa.frames_to_time(np.arange(cqt.shape[1]), 
+                                     sr=sr, hop_length=hop_length)
+        
+        logger.info(f"CQT shape: {cqt.shape}, analyzing {len(times):.1f}s")
+        
+        # 2. For each piano key, do smarter detection
+        detection_threshold = 0.15  # Lower threshold to catch more notes
+        min_note_duration = 0.05    # Minimum 50ms
+        
+        for note_idx in range(n_bins):
+            midi_note = 21 + note_idx  # A0 = MIDI 21
             
-            # Find note end by looking for when magnitude drops significantly
-            end_idx = peak_idx
-            peak_magnitude = magnitude[peak_idx]
+            # Get magnitude profile for this note
+            magnitude = cqt[note_idx, :]
             
-            # Look forward to find where note ends
-            for i in range(peak_idx + 1, min(len(magnitude), peak_idx + int(5 * 44100 / 512))):
-                if magnitude[i] < peak_magnitude * 0.3:  # 30% of peak
-                    end_idx = i
-                    break
+            # Smooth slightly to reduce noise
+            if SCIPY_AVAILABLE:
+                magnitude = ndimage.gaussian_filter1d(magnitude, sigma=1.0)
             else:
-                # Default duration if no clear end found
-                end_idx = min(len(magnitude) - 1, peak_idx + int(1.0 * 44100 / 512))
+                # Simple moving average
+                kernel = np.ones(5) / 5
+                magnitude = np.convolve(magnitude, kernel, mode='same')
             
-            end_time = times[end_idx]
-            duration = end_time - start_time
+            # Adaptive threshold based on this note's characteristics
+            note_mean = np.mean(magnitude)
+            note_std = np.std(magnitude)
             
-            # Only add notes with reasonable duration
-            if duration >= 0.05 and duration <= 20.0:  # 50ms to 20 seconds
-                velocity = int(min(127, max(1, peak_magnitude * 127)))
+            # Use percentile-based threshold (more robust)
+            threshold = max(detection_threshold, 
+                          np.percentile(magnitude, 75))  # 75th percentile
+            threshold = min(threshold, 0.4)  # Cap at reasonable level
+            
+            # Find note regions
+            note_regions = self._find_note_regions(magnitude, times, threshold, min_note_duration)
+            
+            # Create notes for each region
+            for start_time, end_time, strength in note_regions:
+                # Calculate velocity based on strength and note position
+                velocity = self._calculate_velocity(strength, midi_note)
                 
                 note = pretty_midi.Note(
                     velocity=velocity,
@@ -354,356 +193,295 @@ class PianoTranscriber:
                 )
                 notes.append(note)
         
+        logger.info(f"Initial detection: {len(notes)} notes")
         return notes
-
-    def _clean_notes(self, notes: List[pretty_midi.Note]) -> List[pretty_midi.Note]:
-        """Clean up the note list by removing very short notes and fixing overlaps"""
+    
+    def _find_note_regions(self, magnitude: np.ndarray, times: np.ndarray, 
+                          threshold: float, min_duration: float) -> List[Tuple[float, float, float]]:
+        """Find continuous regions where note is active"""
+        regions = []
+        
+        # Find where magnitude exceeds threshold
+        above_threshold = magnitude > threshold
+        
+        # Find continuous regions
+        in_note = False
+        start_idx = 0
+        
+        for i, is_above in enumerate(above_threshold):
+            if is_above and not in_note:
+                # Start of note
+                start_idx = i
+                in_note = True
+            elif not is_above and in_note:
+                # End of note
+                end_idx = i
+                duration = times[end_idx] - times[start_idx]
+                
+                if duration >= min_duration:
+                    # Calculate average strength in this region
+                    strength = np.mean(magnitude[start_idx:end_idx])
+                    regions.append((times[start_idx], times[end_idx], strength))
+                
+                in_note = False
+        
+        # Handle case where note continues to end
+        if in_note:
+            end_idx = len(magnitude) - 1
+            duration = times[end_idx] - times[start_idx]
+            if duration >= min_duration:
+                strength = np.mean(magnitude[start_idx:end_idx])
+                regions.append((times[start_idx], times[end_idx], strength))
+        
+        return regions
+    
+    def _calculate_velocity(self, strength: float, midi_note: int) -> int:
+        """Calculate MIDI velocity based on strength and note characteristics"""
+        # Base velocity from strength
+        base_velocity = int(strength * 100)
+        
+        # Adjust for piano characteristics
+        # Higher notes tend to be played softer, lower notes harder
+        if midi_note < 40:  # Low notes
+            velocity = base_velocity + 10
+        elif midi_note > 80:  # High notes
+            velocity = base_velocity - 5
+        else:
+            velocity = base_velocity
+        
+        # Add some musical variation
+        velocity += np.random.randint(-8, 8)
+        
+        # Clamp to valid MIDI range
+        return max(20, min(127, velocity))
+    
+    def _smart_cleanup(self, notes: List[pretty_midi.Note]) -> List[pretty_midi.Note]:
+        """Intelligent cleanup that preserves musical content"""
         if not notes:
             return notes
-        
-        # Remove notes shorter than 50ms
-        notes = [note for note in notes if (note.end - note.start) >= 0.05]
         
         # Sort by start time
         notes.sort(key=lambda x: x.start)
         
-        # Remove excessive overlaps for same pitch
-        cleaned_notes = []
+        logger.info(f"Cleaning up {len(notes)} notes...")
+        
+        # 1. Remove extremely short notes (likely artifacts)
+        notes = [n for n in notes if (n.end - n.start) >= 0.04]  # Min 40ms
+        
+        # 2. Group notes by pitch and clean up obvious duplicates
+        pitch_groups = {}
         for note in notes:
-            # Check if this note overlaps significantly with recent notes of same pitch
-            overlapping = False
-            for existing in cleaned_notes[-10:]:  # Check last 10 notes
-                if (existing.pitch == note.pitch and 
-                    existing.end > note.start and 
-                    (existing.end - note.start) > 0.1):  # 100ms overlap
-                    overlapping = True
-                    break
+            if note.pitch not in pitch_groups:
+                pitch_groups[note.pitch] = []
+            pitch_groups[note.pitch].append(note)
+        
+        cleaned_notes = []
+        
+        for pitch, pitch_notes in pitch_groups.items():
+            # Sort by start time
+            pitch_notes.sort(key=lambda x: x.start)
             
-            if not overlapping:
-                cleaned_notes.append(note)
-        
-        return cleaned_notes
-
-    def _transcribe_basic_improved(self, input_audio: str, output_dir: str) -> str:
-        """Improved basic transcription without scipy dependency"""
-        logger.info("Using improved basic transcription method")
-        
-        # Load audio with higher sample rate
-        y, sr = librosa.load(input_audio, sr=44100)
-        
-        # Enhance audio quality
-        y = self._preprocess_audio(y, sr)
-        
-        # Create MIDI object
-        pm = pretty_midi.PrettyMIDI()
-        piano = pretty_midi.Instrument(program=0)
-        
-        # Parameters
-        hop_length = 512
-        n_fft = 4096
-        
-        # Get STFT for analysis
-        D = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
-        magnitude = np.abs(D)
-        
-        # Get time and frequency axes
-        times = librosa.frames_to_time(np.arange(magnitude.shape[1]), 
-                                     sr=sr, hop_length=hop_length)
-        freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
-        
-        # Piano frequency range (A0 to C8)
-        piano_notes = []
-        for midi_note in range(21, 109):  # A0 to C8
-            freq = librosa.note_to_hz(librosa.midi_to_note(midi_note))
-            piano_notes.append((midi_note, freq))
-        
-        # For each piano note, find the closest frequency bin
-        for midi_note, target_freq in piano_notes:
-            freq_bin = np.argmin(np.abs(freqs - target_freq))
+            # Remove notes that are too close together (likely duplicates)
+            filtered_pitch_notes = []
             
-            if freq_bin >= len(freqs):
-                continue
+            for note in pitch_notes:
+                # Check if this note overlaps significantly with recent notes
+                too_close = False
                 
-            # Get magnitude profile for this frequency
-            note_magnitude = magnitude[freq_bin, :]
-            
-            # Simple peak detection without scipy
-            notes = self._detect_notes_simple(note_magnitude, times, midi_note)
-            piano.notes.extend(notes)
-        
-        # Sort and clean notes
-        piano.notes.sort(key=lambda x: x.start)
-        piano.notes = self._clean_notes_simple(piano.notes)
-        
-        pm.instruments.append(piano)
-        
-        # Save MIDI
-        base = os.path.splitext(os.path.basename(input_audio))[0]
-        midi_path = os.path.join(output_dir, f"{base}_basic_improved.mid")
-        pm.write(midi_path)
-        
-        return midi_path
-
-    def _detect_notes_simple(self, magnitude: np.ndarray, times: np.ndarray, 
-                           midi_note: int) -> List[pretty_midi.Note]:
-        """Simple note detection without scipy"""
-        notes = []
-        
-        # Smooth the signal manually
-        window_size = 5
-        smoothed = np.convolve(magnitude, np.ones(window_size)/window_size, mode='same')
-        
-        # Adaptive threshold
-        mean_mag = np.mean(smoothed)
-        std_mag = np.std(smoothed)
-        threshold = mean_mag + 1.5 * std_mag
-        threshold = max(threshold, 0.05)
-        
-        # Simple peak detection
-        above_threshold = smoothed > threshold
-        
-        # Find onset and offset points
-        i = 0
-        while i < len(above_threshold) - 1:
-            if above_threshold[i] and not (i > 0 and above_threshold[i-1]):
-                # Found onset
-                onset_idx = i
-                
-                # Find offset
-                offset_idx = onset_idx
-                for j in range(onset_idx + 1, len(above_threshold)):
-                    if not above_threshold[j]:
-                        offset_idx = j
-                        break
-                else:
-                    offset_idx = len(above_threshold) - 1
-                
-                # Create note if long enough
-                duration = times[offset_idx] - times[onset_idx]
-                if duration >= 0.1 and duration <= 10.0:  # 100ms to 10 seconds
-                    peak_magnitude = np.max(smoothed[onset_idx:offset_idx+1])
-                    velocity = int(min(127, max(30, peak_magnitude * 300)))
+                for existing in filtered_pitch_notes[-2:]:  # Check last 2 notes only
+                    time_gap = note.start - existing.start
                     
-                    note = pretty_midi.Note(
-                        velocity=velocity,
-                        pitch=midi_note,
-                        start=times[onset_idx],
-                        end=times[offset_idx]
-                    )
-                    notes.append(note)
+                    if time_gap < 0.1:  # Within 100ms
+                        # Keep the stronger note
+                        if note.velocity > existing.velocity:
+                            filtered_pitch_notes.remove(existing)
+                        else:
+                            too_close = True
+                        break
                 
-                i = offset_idx
-            else:
-                i += 1
-        
-        return notes
-
-    def _clean_notes_simple(self, notes: List[pretty_midi.Note]) -> List[pretty_midi.Note]:
-        """Simple note cleaning without scipy"""
-        if not notes:
-            return notes
-        
-        # Remove very short notes
-        notes = [note for note in notes if (note.end - note.start) >= 0.08]
-        
-        # Sort by start time
-        notes.sort(key=lambda x: x.start)
-        
-        # Remove overlapping notes of same pitch
-        cleaned_notes = []
-        for note in notes:
-            # Check for overlap with recent notes of same pitch
-            should_add = True
-            for existing in cleaned_notes[-5:]:  # Check last 5 notes
-                if (existing.pitch == note.pitch and 
-                    existing.end > note.start + 0.05):  # 50ms tolerance
-                    should_add = False
-                    break
+                if not too_close:
+                    filtered_pitch_notes.append(note)
             
-            if should_add:
-                cleaned_notes.append(note)
+            cleaned_notes.extend(filtered_pitch_notes)
         
+        # 3. Final sort by start time
+        cleaned_notes.sort(key=lambda x: x.start)
+        
+        # 4. Adjust overlapping notes (less aggressive)
+        for i in range(len(cleaned_notes) - 1):
+            current = cleaned_notes[i]
+            next_note = cleaned_notes[i + 1]
+            
+            # If current note overlaps with next note significantly
+            overlap = current.end - next_note.start
+            if overlap > 0.2 and current.pitch != next_note.pitch:
+                # Reduce overlap but don't eliminate it completely
+                current.end = next_note.start + 0.05  # 50ms overlap allowed
+        
+        logger.info(f"Cleanup result: {len(notes)} -> {len(cleaned_notes)} notes")
         return cleaned_notes
-
+    
     def process_midi(self, midi_path: str) -> str:
-        """Process MIDI with quantization, hand separation and other enhancements"""
-        logger.info("Processing MIDI with advanced features")
-
+        """Apply post-processing to MIDI"""
+        logger.info("Post-processing MIDI...")
+        
         try:
             pm = pretty_midi.PrettyMIDI(midi_path)
         except Exception as e:
-            logger.error(f"Failed to load MIDI file {midi_path}: {e}")
+            logger.error(f"Failed to load MIDI: {e}")
             return midi_path
-
-        # Apply quantization if requested
-        if self.config.get("quantize", True):
-            pm = self._quantize_midi(pm)
-
-        # Apply hand separation
+        
+        # Apply quantization if requested (gentler)
+        if self.config.get("quantize", False):  # Default off
+            pm = self._gentle_quantize(pm)
+        
+        # Separate hands if requested
         if self.config.get("separate_hands", True):
             pm = self._separate_hands(pm)
-
-        # Apply piano-specific processing
-        pm = self._process_piano_specifics(pm)
-
-        # Save the processed MIDI
+        
+        # Adjust velocities for more natural sound
+        pm = self._adjust_velocities(pm)
+        
+        # Save processed version
         output_path = midi_path.replace(".mid", "_processed.mid")
         try:
             pm.write(output_path)
-            logger.info(f"Processed MIDI saved to: {output_path}")
+            logger.info(f"Processed MIDI saved: {output_path}")
             return output_path
         except Exception as e:
             logger.error(f"Failed to save processed MIDI: {e}")
             return midi_path
-
-    def _quantize_midi(self, pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
-        """Quantize note timings to a musical grid"""
-        division = self.config.get("quantize_division", 16)
+    
+    def _gentle_quantize(self, pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
+        """Gentle quantization that preserves musical expression"""
+        division = 16  # 16th notes
         
+        # Get tempo
         tempo_changes = pm.get_tempo_changes()
         tempo = tempo_changes[1][0] if len(tempo_changes[1]) > 0 else 120.0
         
         beat_length = 60.0 / tempo
         grid_size = beat_length / (division / 4)
-
-        logger.info(f"Quantizing to {division} divisions per bar at {tempo} BPM")
-
+        
         for instrument in pm.instruments:
             if instrument.is_drum:
                 continue
-                
+            
             for note in instrument.notes:
-                grid_position = round(note.start / grid_size)
-                quantized_start = grid_position * grid_size
+                # Only quantize if note is close to grid (preserve intentional timing)
+                grid_position = note.start / grid_size
+                nearest_grid = round(grid_position)
+                distance = abs(grid_position - nearest_grid)
                 
-                original_duration = note.end - note.start
-                duration_grid_units = max(1, round(original_duration / grid_size))
-                
-                note.start = quantized_start
-                note.end = quantized_start + (duration_grid_units * grid_size)
-
-        return pm
-
-    def _separate_hands(self, pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
-        """Separate notes into left and right hand piano parts"""
-        logger.info("Separating notes into left and right hand parts")
-
-        new_pm = pretty_midi.PrettyMIDI()
+                if distance < 0.3:  # Only quantize if within 30% of grid
+                    note.start = nearest_grid * grid_size
         
-        tempo_changes = pm.get_tempo_changes()
-        if len(tempo_changes[1]) > 0:
-            new_pm.tempo = tempo_changes[1][0]
-
+        return pm
+    
+    def _separate_hands(self, pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
+        """Separate into left and right hand parts"""
+        split_point = self.config.get("hand_split_point", 60)  # Middle C
+        
+        new_pm = pretty_midi.PrettyMIDI()
         right_hand = pretty_midi.Instrument(program=0, name="Right Hand")
         left_hand = pretty_midi.Instrument(program=0, name="Left Hand")
-
+        
+        # Collect all notes
         all_notes = []
         for instrument in pm.instruments:
             if not instrument.is_drum:
                 all_notes.extend(instrument.notes)
-
-        split_point = self.config.get("hand_split_point", 60)
-
+        
+        # Split by pitch with some overlap for natural playing
         for note in all_notes:
             if note.pitch >= split_point:
                 right_hand.notes.append(note)
             else:
                 left_hand.notes.append(note)
-
+        
+        # Add non-empty instruments
         if right_hand.notes:
             new_pm.instruments.append(right_hand)
         if left_hand.notes:
             new_pm.instruments.append(left_hand)
-
-        new_pm.time_signature_changes = pm.time_signature_changes.copy()
+        
         return new_pm
-
-    def _process_piano_specifics(self, pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
-        """Apply piano-specific processing"""
-        piano_type = self.config.get("piano_type", "grand")
-
-        program_map = {
-            "grand": 0,
-            "bright": 1,
-            "digital": 4
-        }
-        program_num = program_map.get(piano_type, 0)
-
+    
+    def _adjust_velocities(self, pm: pretty_midi.PrettyMIDI) -> pretty_midi.PrettyMIDI:
+        """Adjust velocities for more natural sound"""
         for instrument in pm.instruments:
-            if not instrument.is_drum:
-                instrument.program = program_num
-
-                if self.config.get("normalize_velocity", True):
-                    self._normalize_velocity(instrument)
-
-        return pm
-
-    def _normalize_velocity(self, instrument: pretty_midi.Instrument) -> None:
-        """Normalize note velocities"""
-        if not instrument.notes:
-            return
-
-        velocities = [note.velocity for note in instrument.notes]
-        if not velocities:
-            return
+            if instrument.is_drum:
+                continue
             
-        min_vel = min(velocities)
-        max_vel = max(velocities)
-
-        if min_vel >= 30 and max_vel <= 120:
-            return
-
-        if max_vel == min_vel:
-            for note in instrument.notes:
-                note.velocity = 75
-        else:
-            for note in instrument.notes:
-                normalized = ((note.velocity - min_vel) / (max_vel - min_vel)) * 70 + 40
-                note.velocity = int(max(1, min(127, normalized)))
+            if not instrument.notes:
+                continue
+            
+            # Get velocity statistics
+            velocities = [note.velocity for note in instrument.notes]
+            mean_vel = np.mean(velocities)
+            std_vel = np.std(velocities)
+            
+            # If velocities are too uniform, add some variation
+            if std_vel < 10:
+                for note in instrument.notes:
+                    # Add musical variation
+                    variation = np.random.randint(-12, 12)
+                    note.velocity = max(30, min(120, note.velocity + variation))
+        
+        return pm
 
 
 def main():
-    fixed_dir = r"C:\Users\Jonathan\Documents\midi"
-    output_dir = fixed_dir
-
-    valid_exts = [".mp3", ".wav", ".flac", ".ogg", ".m4a", ".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"]
-
-    files = [f for f in os.listdir(fixed_dir) if os.path.splitext(f)[1].lower() in valid_exts]
-
+    # Configuration
+    input_dir = r"C:\Users\Jonathan\Documents\midi"
+    output_dir = input_dir
+    
+    # Supported formats
+    audio_formats = [".mp3", ".wav", ".flac", ".ogg", ".m4a"]
+    video_formats = [".mp4", ".avi", ".mov", ".mkv", ".flv", ".wmv", ".webm", ".m4v"]
+    valid_formats = audio_formats + video_formats
+    
+    # Find files
+    files = [f for f in os.listdir(input_dir) 
+             if os.path.splitext(f)[1].lower() in valid_formats]
+    
     if not files:
-        print("No audio/video files found in", fixed_dir)
+        print(f"No audio/video files found in {input_dir}")
         return 1
-
-    checkpoint_dir = None
-
+    
+    # Configuration
     config = {
-        "checkpoint_dir": checkpoint_dir,
         "output_dir": output_dir,
-        "min_pitch": 21,
-        "max_pitch": 108,
-        "quantize": True,
-        "quantize_division": 16,
+        "quantize": False,  # Keep natural timing
         "separate_hands": True,
-        "hand_split_point": 60,
-        "piano_type": "grand",
-        "normalize_velocity": True,
-        "use_cli": True,
-        "use_basic_pitch": True  # New option
+        "hand_split_point": 60,  # Middle C
     }
-
+    
+    # Process each file
+    success_count = 0
     for file in files:
-        input_file = os.path.join(fixed_dir, file)
+        input_file = os.path.join(input_dir, file)
         try:
-            print(f"Starting transcription of: {input_file}")
-            transcriber = PianoTranscriber(config)
+            print(f"\n🎵 Processing: {file}")
+            
+            transcriber = AdvancedPianoTranscriber(config)
+            
+            # Transcribe
             midi_path = transcriber.transcribe_audio(input_file)
-            print("Processing MIDI...")
-            processed_midi = transcriber.process_midi(midi_path)
-            print(f"✅ {file} → {os.path.basename(processed_midi)} 변환 완료!")
+            
+            # Post-process
+            processed_path = transcriber.process_midi(midi_path)
+            
+            print(f"✅ Success: {os.path.basename(processed_path)}")
+            success_count += 1
+            
         except Exception as e:
-            print(f"❌ {file} 변환 실패: {e}")
-
+            print(f"❌ Failed to process {file}: {e}")
+            logger.error(f"Error processing {file}", exc_info=True)
+    
+    print(f"\n🎹 Completed: {success_count}/{len(files)} files processed successfully")
     return 0
+
 
 if __name__ == "__main__":
     sys.exit(main())
