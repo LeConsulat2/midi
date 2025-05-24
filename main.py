@@ -209,7 +209,11 @@ class PianoTranscriber:
             cmd = ["basic-pitch", output_dir, input_audio]
         else:
             # Generic Magenta-style syntax
-            cmd = [cmd_name, "--model_dir", self.config.get("checkpoint_dir", ""), 
+            checkpoint_dir = self.config.get("checkpoint_dir", "")
+            if not checkpoint_dir:
+                raise RuntimeError(f"checkpoint_dir required for {cmd_name}")
+            
+            cmd = [cmd_name, "--model_dir", checkpoint_dir, 
                    input_audio, "--output_dir", output_dir]
             
             if self.config.get("min_pitch"):
@@ -352,12 +356,11 @@ class PianoTranscriber:
         # Create new MIDI object
         new_pm = pretty_midi.PrettyMIDI()
         
-        # Get tempo
+        # Copy tempo information properly
         tempo_changes = pm.get_tempo_changes()
         if len(tempo_changes[1]) > 0:
-            new_pm.tempo_changes.append(
-                pretty_midi.TempoChange(tempo_changes[1][0], 0)
-            )
+            # Set initial tempo
+            new_pm.tempo = tempo_changes[1][0]
 
         # Create instruments for left and right hands
         right_hand = pretty_midi.Instrument(program=0, name="Right Hand")
@@ -385,8 +388,7 @@ class PianoTranscriber:
             new_pm.instruments.append(left_hand)
 
         # Copy time signatures
-        for ts in pm.time_signature_changes:
-            new_pm.time_signature_changes.append(ts)
+        new_pm.time_signature_changes = pm.time_signature_changes.copy()
 
         return new_pm
 
