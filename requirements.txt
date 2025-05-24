@@ -1,0 +1,28 @@
+# Requirements for Piano Transcription Script
+# Python 3.9 compatible versions
+
+# Core dependencies (required)
+numpy>=1.20.3,<1.22.0
+librosa>=0.8.1,<0.10.0
+pretty_midi>=0.2.9
+soundfile>=0.10.3
+
+# Video processing (for MP4 support)
+moviepy>=1.0.3
+
+# Optional but recommended for better transcription
+tensorflow>=2.8.0,<2.10.0
+# magenta>=2.1.3  # Uncomment if you want full Magenta support
+
+# Additional audio processing
+python-rtmidi>=1.5.0
+
+# For faster processing (optional)
+numba>=0.54.1
+llvmlite>=0.37.0
+
+# For better CLI output (optional)
+rich>=10.12.0
+
+# Audio format support
+pydub>=0.25.1  # For MP3 support
