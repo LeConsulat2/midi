@@ -7,8 +7,15 @@ librosa>=0.8.1,<0.10.0
 pretty_midi>=0.2.9
 soundfile>=0.10.3
 
+# MISSING DEPENDENCY - Required for enhanced transcription
+scipy>=1.7.3,<1.10.0
+
 # Video processing (for MP4 support)
 moviepy>=1.0.3
+
+# Best transcription tool (HIGHLY RECOMMENDED)
+# Note: Latest version for Python 3.9
+basic-pitch>=0.4.0,<1.0.0
 
 # Optional but recommended for better transcription
 tensorflow>=2.8.0,<2.10.0
@@ -26,3 +33,6 @@ rich>=10.12.0
 
 # Audio format support
 pydub>=0.25.1  # For MP3 support
+
+# Additional audio codec support
+ffmpeg-python>=0.2.0  # For various audio/video formats
