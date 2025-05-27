@@ -11,196 +11,172 @@ import sys
 from pathlib import Path
 
 class AdvancedPianoToMIDI:
-    def __init__(self, sample_rate=22050, hop_length=512):
+    def __init__(self, sample_rate=22050, hop_length=256):  # Smaller hop for better temporal resolution
         self.sr = sample_rate
         self.hop_length = hop_length
         self.frame_time = hop_length / sample_rate
         
-        # Piano-specific parameters
+        # Piano-specific parameters - MUCH more conservative
         self.piano_range = (21, 108)  # A0 to C8
-        self.min_note_duration = 0.05  # 50ms minimum note
-        self.max_polyphony = 10  # Maximum simultaneous notes
+        self.min_note_duration = 0.1  # 100ms minimum (was too short at 50ms)
+        self.max_polyphony = 6  # Reduced from 10 - most piano music has 4-6 simultaneous notes max
         
-        # CQT parameters optimized for piano
-        self.bins_per_octave = 36  # Higher resolution for better pitch accuracy
-        self.n_bins = 7 * self.bins_per_octave  # 7 octaves
+        # CQT parameters - MORE CONSERVATIVE for stability
+        self.bins_per_octave = 12  # Standard semitone resolution (was 36 - too high)
+        self.n_bins = 88  # Exact piano keys
         self.fmin = librosa.midi_to_hz(21)  # A0
         
+        # Critical thresholds
+        self.onset_threshold = 0.3  # Higher threshold to avoid false positives
+        self.pitch_threshold_percentile = 85  # More selective
+        
     def load_and_preprocess(self, audio_path):
-        """Load and preprocess audio with piano-specific optimizations"""
-        # Load audio
-        y, sr = librosa.load(audio_path, sr=self.sr)
+        """Load and preprocess audio with CONSERVATIVE piano-specific optimizations"""
+        print(f"Loading audio: {audio_path}")
+        
+        # Load audio with error handling
+        try:
+            y, sr = librosa.load(audio_path, sr=self.sr, mono=True)
+        except Exception as e:
+            raise Exception(f"Failed to load audio: {e}")
+            
+        if len(y) == 0:
+            raise Exception("Empty audio file")
+            
+        print(f"Audio loaded: {len(y)/self.sr:.2f} seconds, {self.sr} Hz")
         
         # Remove DC offset
         y = y - np.mean(y)
         
-        # Apply gentle high-pass filter to remove rumble
-        b, a = scipy.signal.butter(4, 80, btype='high', fs=self.sr)
+        # Gentle pre-emphasis for piano clarity
+        y = scipy.signal.lfilter([1, -0.95], [1], y)
+        
+        # Remove very low frequencies (below piano range)
+        nyquist = self.sr / 2
+        low_cutoff = 20 / nyquist  # 20 Hz
+        high_cutoff = 8000 / nyquist  # 8 kHz (piano harmonics)
+        
+        b, a = scipy.signal.butter(4, [low_cutoff, high_cutoff], btype='band')
         y = scipy.signal.filtfilt(b, a, y)
         
-        # Dynamic range compression (gentle)
-        y = np.sign(y) * np.power(np.abs(y), 0.8)
-        
-        # Normalize
-        y = librosa.util.normalize(y)
+        # GENTLE normalization - preserve dynamics
+        max_val = np.max(np.abs(y))
+        if max_val > 0:
+            y = y / max_val * 0.8  # Leave headroom
         
         return y
     
-    def extract_spectral_features(self, y):
-        """Extract multiple spectral representations"""
-        # High-resolution CQT for pitch detection
-        cqt = np.abs(librosa.cqt(y, sr=self.sr, hop_length=self.hop_length,
-                                 fmin=self.fmin, n_bins=self.n_bins,
-                                 bins_per_octave=self.bins_per_octave,
-                                 filter_scale=0.8))  # Sharper filters
+    def extract_piano_optimized_cqt(self, y):
+        """Extract CQT specifically optimized for piano transcription"""
+        print("Computing Constant-Q Transform...")
         
-        # Chroma for harmonic analysis
-        chroma = librosa.feature.chroma_cqt(C=cqt, bins_per_octave=self.bins_per_octave)
-        
-        # Spectral centroid and rolloff for note quality assessment
-        spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=self.sr, hop_length=self.hop_length)[0]
-        spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=self.sr, hop_length=self.hop_length)[0]
-        
-        return cqt, chroma, spectral_centroids, spectral_rolloff
-    
-    def advanced_onset_detection(self, y, cqt):
-        """Multi-method onset detection with piano-specific tuning"""
-        # Method 1: Spectral flux with adaptive threshold
-        onset_env = librosa.onset.onset_strength(y=y, sr=self.sr, hop_length=self.hop_length,
-                                                 aggregate=np.median, fmax=4000)
-        
-        # Method 2: Complex domain flux from CQT
-        cqt_complex = librosa.cqt(y, sr=self.sr, hop_length=self.hop_length,
-                                  fmin=self.fmin, n_bins=self.n_bins,
-                                  bins_per_octave=self.bins_per_octave)
-        complex_flux = np.sum(np.abs(np.diff(cqt_complex, axis=1)), axis=0)
-        complex_flux = np.concatenate([[0], complex_flux])
-        
-        # Method 3: High-frequency content for percussive onsets
-        hfc = librosa.onset.onset_strength(y=y, sr=self.sr, hop_length=self.hop_length,
-                                          feature=librosa.feature.spectral_centroid)
-        
-        # Combine methods with weights
-        combined_onset = 0.4 * onset_env + 0.4 * complex_flux + 0.2 * hfc
-        
-        # Adaptive peak picking
-        onset_frames = librosa.onset.onset_detect(
-            onset_envelope=combined_onset,
-            sr=self.sr,
+        # Use standard CQT with piano-specific parameters
+        cqt_complex = librosa.cqt(
+            y, 
+            sr=self.sr, 
             hop_length=self.hop_length,
-            pre_max=5,
-            post_max=5,
-            pre_avg=5,
-            post_avg=5,
-            delta=0.1,
-            wait=5
+            fmin=self.fmin, 
+            n_bins=self.n_bins,
+            bins_per_octave=self.bins_per_octave,
+            filter_scale=1.0,  # Standard filtering
+            norm=1,
+            sparsity=0.01
         )
         
-        return onset_frames, combined_onset
+        # Get magnitude
+        cqt_mag = np.abs(cqt_complex)
+        
+        # Apply logarithmic compression to handle piano's wide dynamic range
+        cqt_db = librosa.amplitude_to_db(cqt_mag, ref=np.max)
+        
+        # Normalize to 0-1 range
+        cqt_normalized = (cqt_db - np.min(cqt_db)) / (np.max(cqt_db) - np.min(cqt_db))
+        
+        return cqt_normalized, cqt_complex
     
-    def harmonic_suppression(self, cqt):
-        """Suppress harmonics to isolate fundamentals"""
-        # Create harmonic suppression matrix
-        suppressed_cqt = cqt.copy()
+    def smart_onset_detection(self, y):
+        """Robust onset detection for piano"""
+        print("Detecting note onsets...")
         
-        for frame in range(cqt.shape[1]):
-            spectrum = cqt[:, frame]
-            
-            # Find peaks
-            peaks, properties = scipy.signal.find_peaks(
-                spectrum, 
-                height=np.max(spectrum) * 0.1,
-                distance=3
-            )
-            
-            if len(peaks) > 0:
-                # For each peak, suppress its harmonics
-                for peak in peaks:
-                    # Calculate harmonic positions
-                    fundamental_freq = self.fmin * (2 ** (peak / self.bins_per_octave))
-                    
-                    for harmonic in [2, 3, 4, 5, 6]:
-                        harmonic_freq = fundamental_freq * harmonic
-                        if harmonic_freq < self.sr / 2:
-                            harmonic_bin = int(self.bins_per_octave * np.log2(harmonic_freq / self.fmin))
-                            if harmonic_bin < len(spectrum):
-                                # Reduce harmonic energy
-                                suppression_factor = 0.3 / harmonic  # Stronger suppression for higher harmonics
-                                suppressed_cqt[harmonic_bin, frame] *= suppression_factor
+        # Multiple onset detection methods
+        onset_envelope = librosa.onset.onset_strength(
+            y=y, 
+            sr=self.sr, 
+            hop_length=self.hop_length,
+            aggregate=np.median,
+            fmax=4000,
+            center=True
+        )
         
-        return suppressed_cqt
+        # Peak picking with conservative parameters
+        onset_frames = librosa.onset.onset_detect(
+            onset_envelope=onset_envelope,
+            sr=self.sr,
+            hop_length=self.hop_length,
+            pre_max=3,    # Smaller window
+            post_max=3,
+            pre_avg=3,
+            post_avg=3,
+            delta=self.onset_threshold,  # Higher threshold
+            wait=10       # Minimum time between onsets (frames)
+        )
+        
+        onset_times = librosa.frames_to_time(onset_frames, sr=self.sr, hop_length=self.hop_length)
+        print(f"Found {len(onset_times)} potential onsets")
+        
+        return onset_frames, onset_times, onset_envelope
     
-    def polyphonic_nmf_separation(self, cqt, n_components=88):
-        """Use NMF to separate overlapping notes"""
-        # Transpose for NMF (features x samples)
-        cqt_nmf = cqt.T
-        
-        # Apply NMF
-        model = NMF(n_components=n_components, init='nndsvd', max_iter=200, 
-                   alpha_W=0.1, alpha_H=0.1, random_state=42)
-        W = model.fit_transform(cqt_nmf)  # Time x Components
-        H = model.components_  # Components x Frequency
-        
-        # Reconstruct individual components
-        separated_spectrograms = []
-        for i in range(n_components):
-            component_spectrogram = np.outer(W[:, i], H[i, :]).T
-            separated_spectrograms.append(component_spectrogram)
-        
-        return separated_spectrograms, W, H
-    
-    def advanced_pitch_tracking(self, cqt, onset_frames):
-        """Track pitches with temporal continuity and polyphony handling"""
-        # Apply harmonic suppression
-        clean_cqt = self.harmonic_suppression(cqt)
-        
-        # Apply median filtering to reduce noise
-        clean_cqt = ndimage.median_filter(clean_cqt, size=(3, 1))
-        
-        # Adaptive threshold per frequency bin
-        thresholds = np.percentile(clean_cqt, 75, axis=1, keepdims=True)
+    def piano_pitch_detection(self, cqt_normalized):
+        """Piano-specific pitch detection with better accuracy"""
+        print("Detecting pitches...")
         
         detected_notes = []
+        n_frames = cqt_normalized.shape[1]
         
-        for frame_idx in range(clean_cqt.shape[1]):
-            frame_spectrum = clean_cqt[:, frame_idx]
+        # Calculate adaptive threshold for each MIDI note
+        note_thresholds = np.percentile(cqt_normalized, self.pitch_threshold_percentile, axis=1)
+        
+        for frame_idx in range(n_frames):
             frame_time = frame_idx * self.frame_time
+            spectrum = cqt_normalized[:, frame_idx]
             
-            # Find peaks above adaptive threshold
-            peaks, properties = scipy.signal.find_peaks(
-                frame_spectrum,
-                height=thresholds.flatten(),
-                distance=2,  # Minimum separation between peaks
-                prominence=0.1
-            )
+            # Find active notes in this frame
+            active_notes = []
             
-            # Convert peaks to MIDI notes
-            frame_notes = []
-            for peak in peaks:
-                midi_note = 21 + (peak * 12 / self.bins_per_octave)
+            for midi_idx in range(self.n_bins):
+                midi_note = 21 + midi_idx  # A0 = 21
                 
-                # Round to nearest semitone
-                midi_note = int(np.round(midi_note))
-                
-                # Only keep notes in piano range
-                if self.piano_range[0] <= midi_note <= self.piano_range[1]:
-                    confidence = frame_spectrum[peak]
-                    frame_notes.append({
-                        'midi_note': midi_note,
-                        'time': frame_time,
-                        'confidence': confidence,
-                        'frame': frame_idx
-                    })
+                if spectrum[midi_idx] > note_thresholds[midi_idx]:
+                    # Additional validation: check local peak
+                    window_start = max(0, midi_idx - 1)
+                    window_end = min(self.n_bins, midi_idx + 2)
+                    local_window = spectrum[window_start:window_end]
+                    
+                    # Must be local maximum
+                    if spectrum[midi_idx] == np.max(local_window):
+                        confidence = spectrum[midi_idx]
+                        active_notes.append({
+                            'midi_note': midi_note,
+                            'time': frame_time,
+                            'confidence': confidence,
+                            'frame': frame_idx
+                        })
             
-            # Sort by confidence and keep top N
-            frame_notes.sort(key=lambda x: x['confidence'], reverse=True)
-            detected_notes.extend(frame_notes[:self.max_polyphony])
+            # Keep only top notes by confidence
+            active_notes.sort(key=lambda x: x['confidence'], reverse=True)
+            detected_notes.extend(active_notes[:self.max_polyphony])
         
+        print(f"Detected {len(detected_notes)} pitch events")
         return detected_notes
     
-    def note_consolidation_and_tracking(self, detected_notes, onset_frames):
-        """Convert detected pitches into proper note events with durations"""
-        # Group detections by MIDI note
+    def intelligent_note_tracking(self, detected_notes, onset_times):
+        """Convert pitch detections to musical notes with smart tracking"""
+        print("Tracking and consolidating notes...")
+        
+        if not detected_notes:
+            return []
+        
+        # Group by MIDI note number
         note_groups = defaultdict(list)
         for note in detected_notes:
             note_groups[note['midi_note']].append(note)
@@ -208,43 +184,29 @@ class AdvancedPianoToMIDI:
         final_notes = []
         
         for midi_note, detections in note_groups.items():
-            if not detections:
+            if len(detections) < 5:  # Need sufficient evidence
                 continue
                 
             # Sort by time
             detections.sort(key=lambda x: x['time'])
             
-            # Group into continuous segments
-            segments = []
-            current_segment = [detections[0]]
+            # Group into note segments using onset information
+            segments = self.segment_note_detections(detections, onset_times)
             
-            for i in range(1, len(detections)):
-                time_gap = detections[i]['time'] - detections[i-1]['time']
-                
-                # If gap is small, continue segment
-                if time_gap <= self.frame_time * 3:  # Allow small gaps
-                    current_segment.append(detections[i])
-                else:
-                    # Start new segment
-                    if len(current_segment) >= 3:  # Minimum segment length
-                        segments.append(current_segment)
-                    current_segment = [detections[i]]
-            
-            # Don't forget the last segment
-            if len(current_segment) >= 3:
-                segments.append(current_segment)
-            
-            # Convert segments to notes
+            # Convert segments to final notes
             for segment in segments:
+                if len(segment) < 3:  # Too short to be a real note
+                    continue
+                    
                 start_time = segment[0]['time']
                 end_time = segment[-1]['time'] + self.frame_time
                 duration = end_time - start_time
                 
-                # Filter out very short notes (likely noise)
                 if duration >= self.min_note_duration:
-                    # Calculate average confidence as velocity
+                    # Calculate velocity from confidence
                     avg_confidence = np.mean([d['confidence'] for d in segment])
-                    velocity = int(np.clip(avg_confidence * 127, 20, 127))
+                    # Scale velocity more conservatively
+                    velocity = int(np.clip(30 + avg_confidence * 80, 30, 110))
                     
                     final_notes.append({
                         'midi_note': midi_note,
@@ -253,99 +215,163 @@ class AdvancedPianoToMIDI:
                         'velocity': velocity
                     })
         
+        # Sort by start time
+        final_notes.sort(key=lambda x: x['start_time'])
+        
+        print(f"Final notes: {len(final_notes)}")
         return final_notes
+    
+    def segment_note_detections(self, detections, onset_times):
+        """Segment continuous detections into individual notes"""
+        if not detections:
+            return []
+        
+        segments = []
+        current_segment = [detections[0]]
+        
+        # Maximum gap between detections in same note
+        max_gap = self.frame_time * 8  # Allow some discontinuity
+        
+        for i in range(1, len(detections)):
+            current_time = detections[i]['time']
+            prev_time = detections[i-1]['time']
+            time_gap = current_time - prev_time
+            
+            # Check if there's an onset between prev and current
+            onset_between = any(prev_time < onset < current_time for onset in onset_times)
+            
+            if time_gap <= max_gap and not onset_between:
+                # Continue current segment
+                current_segment.append(detections[i])
+            else:
+                # Start new segment
+                if len(current_segment) >= 3:
+                    segments.append(current_segment)
+                current_segment = [detections[i]]
+        
+        # Don't forget last segment
+        if len(current_segment) >= 3:
+            segments.append(current_segment)
+        
+        return segments
     
     def create_midi(self, notes, output_path):
         """Create MIDI file from detected notes"""
-        # Create a PrettyMIDI object
-        midi = pretty_midi.PrettyMIDI()
+        if not notes:
+            raise Exception("No notes detected - cannot create MIDI file")
+        
+        print(f"Creating MIDI file with {len(notes)} notes...")
+        
+        # Create MIDI object
+        midi = pretty_midi.PrettyMIDI(initial_tempo=120.0)
         
         # Create piano instrument
-        piano = pretty_midi.Instrument(program=0)  # Acoustic Grand Piano
+        piano = pretty_midi.Instrument(program=0, is_drum=False, name='Piano')
         
         for note_data in notes:
-            note = pretty_midi.Note(
-                velocity=note_data['velocity'],
-                pitch=note_data['midi_note'],
-                start=note_data['start_time'],
-                end=note_data['end_time']
-            )
-            piano.notes.append(note)
+            try:
+                note = pretty_midi.Note(
+                    velocity=int(note_data['velocity']),
+                    pitch=int(note_data['midi_note']),
+                    start=float(note_data['start_time']),
+                    end=float(note_data['end_time'])
+                )
+                piano.notes.append(note)
+            except Exception as e:
+                print(f"Warning: Skipping invalid note {note_data}: {e}")
+                continue
+        
+        if not piano.notes:
+            raise Exception("No valid notes created")
         
         midi.instruments.append(piano)
         
-        # Save MIDI file
-        midi.write(output_path)
+        # Write MIDI file
+        try:
+            midi.write(output_path)
+            print(f"MIDI file saved: {output_path}")
+        except Exception as e:
+            raise Exception(f"Failed to write MIDI file: {e}")
         
         return midi
     
     def convert(self, input_path, output_path, debug=False):
-        """Main conversion pipeline"""
-        print("Loading and preprocessing audio...")
-        y = self.load_and_preprocess(input_path)
-        
-        print("Extracting spectral features...")
-        cqt, chroma, centroids, rolloff = self.extract_spectral_features(y)
-        
-        print("Detecting onsets...")
-        onset_frames, onset_strength = self.advanced_onset_detection(y, cqt)
-        onset_times = librosa.frames_to_time(onset_frames, sr=self.sr, hop_length=self.hop_length)
-        
-        print(f"Found {len(onset_frames)} onsets")
-        
-        print("Tracking pitches...")
-        detected_notes = self.advanced_pitch_tracking(cqt, onset_frames)
-        
-        print(f"Detected {len(detected_notes)} note candidates")
-        
-        print("Consolidating notes...")
-        final_notes = self.note_consolidation_and_tracking(detected_notes, onset_frames)
-        
-        print(f"Final note count: {len(final_notes)}")
-        
-        print("Creating MIDI file...")
-        midi = self.create_midi(final_notes, output_path)
-        
-        if debug:
-            self.plot_analysis(y, cqt, onset_strength, onset_frames, final_notes)
-        
-        return midi, final_notes
+        """Main conversion pipeline - IMPROVED"""
+        try:
+            # Step 1: Load and preprocess
+            y = self.load_and_preprocess(input_path)
+            
+            # Step 2: Extract spectral features
+            cqt_normalized, cqt_complex = self.extract_piano_optimized_cqt(y)
+            
+            # Step 3: Onset detection
+            onset_frames, onset_times, onset_envelope = self.smart_onset_detection(y)
+            
+            # Step 4: Pitch detection
+            detected_notes = self.piano_pitch_detection(cqt_normalized)
+            
+            # Step 5: Note tracking and consolidation
+            final_notes = self.intelligent_note_tracking(detected_notes, onset_times)
+            
+            if not final_notes:
+                print("⚠️  No notes detected in audio")
+                return None, []
+            
+            # Step 6: Create MIDI
+            midi = self.create_midi(final_notes, output_path)
+            
+            if debug:
+                self.plot_analysis(y, cqt_normalized, onset_envelope, onset_frames, final_notes)
+            
+            return midi, final_notes
+            
+        except Exception as e:
+            print(f"❌ Conversion failed: {e}")
+            return None, []
     
     def plot_analysis(self, y, cqt, onset_strength, onset_frames, notes):
-        """Debug visualization"""
+        """Debug visualization - IMPROVED"""
         fig, axes = plt.subplots(4, 1, figsize=(15, 12))
         
         # Waveform
-        times = librosa.frames_to_time(np.arange(len(y)), sr=self.sr)
+        times = np.linspace(0, len(y)/self.sr, len(y))
         axes[0].plot(times, y)
-        axes[0].set_title('Waveform')
+        axes[0].set_title('Audio Waveform')
         axes[0].set_ylabel('Amplitude')
         
-        # CQT
-        librosa.display.specshow(librosa.amplitude_to_db(cqt, ref=np.max),
-                                sr=self.sr, hop_length=self.hop_length,
-                                fmin=self.fmin, bins_per_octave=self.bins_per_octave,
-                                x_axis='time', y_axis='cqt_note', ax=axes[1])
-        axes[1].set_title('Constant-Q Transform')
+        # CQT spectrogram
+        times_frames = librosa.frames_to_time(np.arange(cqt.shape[1]), sr=self.sr, hop_length=self.hop_length)
+        midi_notes = np.arange(21, 109)  # A0 to C8
+        
+        im = axes[1].imshow(cqt, aspect='auto', origin='lower', 
+                           extent=[times_frames[0], times_frames[-1], midi_notes[0], midi_notes[-1]],
+                           cmap='magma')
+        axes[1].set_title('Piano Roll Spectrogram (CQT)')
+        axes[1].set_ylabel('MIDI Note')
         
         # Onset detection
-        onset_times = librosa.frames_to_time(np.arange(len(onset_strength)), 
-                                           sr=self.sr, hop_length=self.hop_length)
-        axes[2].plot(onset_times, onset_strength, label='Onset Strength')
+        onset_times_plot = librosa.frames_to_time(np.arange(len(onset_strength)), 
+                                                 sr=self.sr, hop_length=self.hop_length)
+        axes[2].plot(onset_times_plot, onset_strength, label='Onset Strength', alpha=0.7)
         onset_time_points = librosa.frames_to_time(onset_frames, sr=self.sr, hop_length=self.hop_length)
-        axes[2].vlines(onset_time_points, 0, max(onset_strength), color='r', alpha=0.8, label='Onsets')
+        axes[2].vlines(onset_time_points, 0, np.max(onset_strength), 
+                      color='red', alpha=0.8, label='Detected Onsets')
         axes[2].set_title('Onset Detection')
+        axes[2].set_ylabel('Onset Strength')
         axes[2].legend()
         
-        # Piano roll
+        # Final notes (Piano roll)
         for note in notes:
-            axes[3].barh(note['midi_note'], note['end_time'] - note['start_time'],
-                        left=note['start_time'], height=0.8,
-                        alpha=0.7, color='blue')
-        axes[3].set_title('Detected Notes (Piano Roll)')
-        axes[3].set_xlabel('Time (s)')
+            duration = note['end_time'] - note['start_time']
+            alpha = min(1.0, note['velocity'] / 127.0)
+            axes[3].barh(note['midi_note'], duration, left=note['start_time'], 
+                        height=0.8, alpha=alpha, color='green', edgecolor='darkgreen')
+        
+        axes[3].set_title(f'Detected Notes ({len(notes)} notes)')
+        axes[3].set_xlabel('Time (seconds)')
         axes[3].set_ylabel('MIDI Note')
         axes[3].set_ylim(20, 110)
+        axes[3].grid(True, alpha=0.3)
         
         plt.tight_layout()
         plt.show()
@@ -401,8 +427,11 @@ if __name__ == "__main__":
                 input_to_process = input_path
             
             midi, notes = converter.convert(input_to_process, output_file, debug=False)
-            print(f"✅ Success: {os.path.basename(output_file)} ({len(notes)} notes)")
-            success_count += 1
+            if midi and notes:
+                print(f"✅ Success: {os.path.basename(output_file)} ({len(notes)} notes)")
+                success_count += 1
+            else:
+                print(f"❌ Failed: No notes detected in {file}")
             
             # Clean up temp audio
             if temp_audio and os.path.exists(temp_audio):
