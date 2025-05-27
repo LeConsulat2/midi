@@ -36,3 +36,6 @@ pydub>=0.25.1  # For MP3 support
 
 # Additional audio codec support
 ffmpeg-python>=0.2.0  # For various audio/video formats
+
+matplotlib>=3.3.4,<3.6.0
+scikit-learn>=1.0.2,<1.2.0
